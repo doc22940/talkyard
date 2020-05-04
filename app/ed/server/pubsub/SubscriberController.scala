@@ -28,7 +28,7 @@ import ed.server.{EdContext, EdController}
 import ed.server.http._
 import ed.server.security.SidAbsent
 import javax.inject.Inject
-import org.scalactic.{Bad, Good, Or}
+import org.scalactic.{Bad, ErrorMessage, Good, Or}
 import play.{api => p}
 import p.libs.json.{JsString, JsValue, Json}
 import p.mvc.{Action, ControllerComponents, RequestHeader, Result}
@@ -58,24 +58,9 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
         // Or an In and Out stream, for talking with the client.
         Flow[JsValue, JsValue, _]]] = {
 
-    SECURITY // rate limit per ip — let each user connect with at most 1 websocket,
-    // so need not rate limit connections per *user*.
-    //context.rateLimiter.rateLimit(RateLimits.ConnectWebSocket, request)
-    RateLimits.ConnectWebSocket
-
     val site = globals.lookupSiteOrThrow(request)
-    // Todo: If too many subscribesr for  site,  or in total, reject.
-    // Need server config value?
 
-    SECURITY // max N WebSockets per server in total,
-    // max M per site?
-
-    SECURITY // max N WebSockets per server in total,
-    // Max frame size = ...
-    // Max frames per minute = ...
-    // Max burs rate = ...
-
-    val requesterInfo = authenticateWebSocket(site, request) getOrIfBad { result =>
+    val authnReq = authenticateWebSocket(site, request) getOrIfBad { result =>
       // Reject the connection. However, the browser won't really find out why —
       // Chrome etc just shows the status code, e.g. 403 Forbidden, nothing more,
       // apparently to make it harder to use WebSocket for port scanning or
@@ -88,25 +73,33 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
       return Future.successful(Left(result))
     }
 
-    val flow: Flow[JsValue, JsValue, _] = acceptWebSocket(requesterInfo, request)
-    Future.successful(Right(flow))
+    globals.pubSub.mayConnectClient(authnReq.theSiteUserId) map {
+      case Some(problem: ErrorMessage) =>
+        Left(ForbiddenResult("TyEWSTOOMANY", s"You cannot connect: $problem"))
+      case None =>
+
+        // Later: If accepting new topics and replies via WebSocket, then, need to
+        // remember a SpamRelReqStuff here? [WSSPAM]
+
+        // Rate limit connections per ip: set user = None.
+        // (We rate limit *messages* too, per user, see RateLimits.SendWebSocketMessage.)
+        context.rateLimiter.rateLimit(
+              RateLimits.ConnectWebSocket, authnReq.copy(user = None))
+
+        val flow: Flow[JsValue, JsValue, _] = acceptWebSocket(authnReq)
+        Right(flow)
+    }
   }
 
 
-  private class OkWebSocketUpgradeRequest(
-    val site: SiteBrief,
-    val xsrfToken: String,
-    val requester: User,
-    val browserIdData: BrowserIdData)
-
 
   private def authenticateWebSocket(site: SiteBrief, request: RequestHeader)
-        : OkWebSocketUpgradeRequest Or Result = {
+        : AuthnReqHeaderImpl Or Result = {
     import tyCtx.security
 
+    val dao = globals.siteDao(site.id)
     val requestOrigin = request.headers.get(play.api.http.HeaderNames.ORIGIN)
     val siteCanonicalOrigin = globals.originOfSiteId(site.id)
-
 
     // If the Origin header isn't the server's origin, then, maybe this is a
     // xsrf attack request — reply Forbidden. (We look for a xsrf token in the first
@@ -121,15 +114,18 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
     }
 
     // A bit dupl code — the same as for normal HTTP requests. [WSHTTPREQ]
-    val dao = globals.siteDao(site.id)
     val expireIdleAfterMins = dao.getWholeSiteSettings().expireIdleAfterMins
 
-    // Eh, hmm, this won't work — there's no xsrf token header.
-    // Use the WebSocket's "protocol" thing, for xsrf token?
+    // We check the xsrf token later — since a WebSocket upgrade request
+    // cannot have a request body or custom header with xsrf token.
+    // (checkSidAndXsrfToken() won't throw for GET requests. [GETNOTHROW])
     val (actualSidStatus, xsrfOk, _ /* newCookies */) =
-        security.checkSidAndXsrfToken(   // throws things — want that?
+        security.checkSidAndXsrfToken(
             request, anyRequestBody = None, siteId = site.id,
             expireIdleAfterMins = expireIdleAfterMins, maySetCookies = false)
+
+    // Needs to be a cookie already set. [WSXSRF]
+    dieIf(xsrfOk.value.isEmpty, "TyE406WKTDK")
 
     val (mendedSidStatus, _ /* deleteSidCookie */) =
       if (actualSidStatus.canUse) (actualSidStatus, false)
@@ -164,18 +160,14 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
 
     val requester = requesterMaybeSuspended
 
-    // A bit dupl code, see DebikiRequest [WSHTTPREQ]
-    val ip: IpAddress = security.realOrFakeIpOf(request)
-    val browserIdData = BrowserIdData(
-          ip = ip, idCookie = anyBrowserId.map(_.cookieValue), fingerprint = 0)
+    val authnReq = AuthnReqHeaderImpl(site, sid = mendedSidStatus, xsrfOk,
+          anyBrowserId, Some(requester), dao, request)
 
-    Good(new OkWebSocketUpgradeRequest(
-        site, xsrfOk.value, requester, browserIdData))
+    Good(authnReq)
   }
 
 
-  private def acceptWebSocket(requesterInfo: OkWebSocketUpgradeRequest, request: RequestHeader)
-        : Flow[JsValue, JsValue, _] = {
+  private def acceptWebSocket(req: AuthnReqHeader): Flow[JsValue, JsValue, _] = {
 
     // Use Sink and Source directly.
     // Could have used this Actor thing:
@@ -198,13 +190,13 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
     // actors in Talkyard's case anyway.
 
     import akka.stream.scaladsl.{Flow, Sink, Source}
-    import requesterInfo.{site, requester, browserIdData}
+    import req.{site, theRequester => requester}
 
     @volatile
     var authenticatedViaWebSocket = false
 
     @volatile
-    var anyWebSocketClient: Option[UserSubscribed] = None
+    var anyWebSocketClient: Option[UserConnected] = None
 
     val foreachSink = Sink.foreach[JsValue](jsValue => {
       anyWebSocketClient match {
@@ -217,7 +209,7 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
             // This should be an xsrf token.
             jsValue match {
               case JsString(value) =>
-                if (value != requesterInfo.xsrfToken) {
+                if (value != req.xsrfToken.value) {
                   // Close — bad xsrf token. [WSXSRF]
                   logger.debug(s"$prefix $who sent bad xsrf token: '$value' [TyEWSXSRF]")
                   client.wsOut.offer(JsString(
@@ -226,10 +218,17 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
                 }
                 else {
                   // Let's talk.
-                  logger.debug(s"$prefix $who connected  [TyMWSCONN]")
+                  logger.debug(o"""$prefix $who connected, telling PubSubActor, it'll
+                      watch page ids: ${client.watchedPageIds}  [TyMWSCONN]""")
                   client.wsOut.offer(JsString(s"OkHi @${client.user.usernameOrGuestName}"))
                   authenticatedViaWebSocket = true
-                  globals.pubSub.userSubscribed(client)
+
+                  RACE // [WATCHBRACE]
+                  val dao = globals.siteDao(site.id)
+                  val watchbar = dao.getOrCreateWatchbar(requester.id)
+                  val clientWithPages = client.copy(watchedPageIds = watchbar.watchedPageIds)
+
+                  globals.pubSub.userSubscribed(clientWithPages)
                 }
               case other =>
                 // Close — got no xsrf token.
@@ -240,11 +239,46 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
           }
           else {
             logger.trace(s"$prefix $who sent: $jsValue [TyEWSGOTMSG]")
-            // globals.pubSub.onMessage( ... )  ?
 
-            // Later: Only if really active!
-            globals.pubSub.userIsActive(
-                client.siteId, client.user, client.browserIdData)
+            val rateLimitData = SomethingToRateLimitImpl(
+              siteId = site.id,
+              user = Some(client.user),
+              ip = client.browserIdData.ip,
+              ctime = globals.now.toJavaDate,
+              shallSkipRateLimitsBecauseIsTest = false,  // for now
+              hasOkE2eTestPassword = false)  // for now
+
+            // New connections are also rate limited, see: RateLimits.ConnectWebSocket
+            context.rateLimiter.rateLimit(
+                  RateLimits.SendWebSocketMessage, rateLimitData)
+
+            // ? maybe use:
+            //   https://github.com/circe/circe
+            //     val decodedFoo = decode[Foo](json)
+            //     no runtime reflection
+            //     Wow! It's like 3-4x faster than Play, for parsing? and 2-10x for writing?
+            //     https://github.com/circe/circe-benchmarks
+            //     Argonaut, Json4s, Play, Spray are all slower.
+            //     https://github.com/circe/circe-derivation
+            //       macro-supported derivation of circe's type class instances
+
+            //   https://github.com/tototoshi/play-json4s — from Lift (don't like)
+            //     "Case classes can be used to extract values from parsed JSON"
+            //     json.extract[Person]
+            //     Apparently uses reflection — so avoid.
+            //       https://stackoverflow.com/a/41333676/694469
+            //       jon4s: "you provide a Scala Manifest for it". Because Manifest
+            //       is a Scala trait used for reflection"
+
+            // globals.pubSub.onMessage( ... )  ?
+            // — no. Instead, dispatch the message as if it was a normal http request?
+            // it's just that now we know already who the user is, no authentication needed
+            // (only authorization).
+
+            // And, if the message means the human was active:
+            // globals.pubSub.userIsActive(
+            //     client.siteId, client.user, client.browserIdData)
+            // — but that'd be done by the message/request handler.
           }
       }
     })
@@ -264,13 +298,11 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
       Flow.fromSinkAndSourceMat(inSink,  outSource) { (_, outboundMat: SourceQueue) =>
         // The WebSocket is now active. Wait for the client to send its
         // session id — because checking the cookie and Origin header, might
-        // not be enough, if the browser is weird.
+        // not be enough, if the client is weird.
 
-        val dao = globals.siteDao(site.id)
-        val watchbar = dao.getOrCreateWatchbar(requester.id)
-
-        anyWebSocketClient = Some(UserSubscribed(
-            site.id, requester, browserIdData, watchbar.watchedPageIds, outboundMat))
+        anyWebSocketClient = Some(
+            UserConnected(
+              site.id, requester, req.theBrowserIdData, Set.empty, outboundMat))
 
         logger.debug(s"WS conn: ${requester.nameParaId} [TyMWSCON]")
       }
@@ -282,7 +314,7 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
         var nothingToDo = ""
 
         if (globals.isInitialized) {
-          globals.pubSub.unsubscribeUser(site.id, requester, browserIdData)
+          globals.pubSub.unsubscribeUser(site.id, requester, req.theBrowserIdData)
         }
         else {
           // We're debugging and reloading the app?

@@ -71,6 +71,11 @@ if (eds.useServiceWorker) {
         // Only show dialog, if has been disconnected for so long, so the server
         // stopped caching events for this client, stopped waiting for it to reappear.
         // See [WSMSGQ].
+        // But *skip* dialog for now — reconnections didn't work previously anyway (with
+        // long polling) and the dialog can be annoying.
+        $h.addClasses(document.documentElement, 's_NoInet');
+        logM(`WebSocket broken? Didn't popup any dialog about that, maybe later. [TyE502KDG3]`);
+        /*
         morebundle.openDefaultStupidDialog({
             body: t.ni.PlzRefr,
             primaryButtonTitle: t.ni.RefrNow,
@@ -78,7 +83,7 @@ if (eds.useServiceWorker) {
             onCloseOk: function(whichButton) {
               if (whichButton === 1)
                 window.location.reload()
-            } });
+            } });  */
         break;
       default:
         die("Unknown service worker message type [TyEUNKSWMSG]: " + message.type +
@@ -89,8 +94,8 @@ if (eds.useServiceWorker) {
 
 
 export function startKeepAliveMessages() {
-  // For now.
-  if (!eds.useServiceWorker)
+  // For now.  [0EVTSIFRM]
+  if (!eds.useServiceWorker || isInSomeEmbCommentsIframe())
    return;
 
   let intervalMs = 30*1000;  // [KEEPALVINTV]
@@ -100,8 +105,7 @@ export function startKeepAliveMessages() {
 
   debiki.serviceWorkerPromise.then(function(sw: ServiceWorker) {
     function sendKeepAlive() {
-      const idleSeconds = utils.getIdleSeconds();
-
+      const humanActiveAtMs = utils.getHumanLastActiveAtMs();
       const store: Store = ReactStore.allData();
       const me = store.me;
 
@@ -111,7 +115,7 @@ export function startKeepAliveMessages() {
         const message: WebSocketKeepAliveSwMessage = {
           doWhat: SwDo.KeepWebSocketAlive,
           myId: me.id,
-          idleSecs: idleSeconds,
+          humanActiveAtMs,
           talkyardVersion: TalkyardVersion,
         };
         sw.postMessage(message);
@@ -121,7 +125,10 @@ export function startKeepAliveMessages() {
     }
 
     magicTimeout(intervalMs, sendKeepAlive);
-  });
+
+  }).catch(ex => {
+    logW("Error starting sendKeepAlive() in service worker promise [TyE7SBEV8S]", ex);
+  });;
 }
 
 
@@ -132,7 +139,7 @@ export function subscribeToServerEvents(me: Myself) {
   // so it's not worth the additional server load?
   // Maybe could connect, though, if the user interacts with the page,
   // and the server knows other people also loaded the page just recently.
-  if (isInSomeEmbCommentsIframe())
+  if (isInSomeEmbCommentsIframe())  // [0EVTSIFRM]
     return;
 
   if (eds.useServiceWorker) {
@@ -167,7 +174,7 @@ export function subscribeToServerEvents(me: Myself) {
       };
       sw.postMessage(message);
     }).catch(ex => {
-      console.log("Error subscribing to events via service worker", ex);
+      console.log("Error subscribing to events via service worker [TyE70AKD4]", ex);
     });
   }
   else {
@@ -176,6 +183,22 @@ export function subscribeToServerEvents(me: Myself) {
     // Maybe reimplemelt later, breaking out reusable code from service-worker.ts:
     // subscribeToServerEventsDirectly(me);
   }
+}
+
+
+
+export function disconnectWebSocket() {
+  if (!eds.useServiceWorker)
+    return;
+
+  debiki.serviceWorkerPromise.then(function(sw: ServiceWorker) {
+    const message: MessageToServiceWorker = {
+      doWhat: SwDo.Disconnect,
+      talkyardVersion: TalkyardVersion,
+      myId: undefined,
+    };
+    sw.postMessage(message);
+  });
 }
 
 

@@ -24,6 +24,7 @@ import com.debiki.core.Prelude._
 import com.debiki.core._
 import debiki.dao.RedisCache
 import debiki.{Globals, JsonMaker}
+import org.scalactic.ErrorMessage
 import play.api.libs.json.{JsNull, JsString, JsValue, Json}
 import play.api.libs.ws.{WSClient, WSResponse}
 import redis.RedisClient
@@ -61,8 +62,11 @@ case class StorePatchMessage(
 
 
 case class PubSubState(
-  subscribersBySite: Map[SiteId, Map[UserId, WebSocketClient]],
-  watcherIdsByPageSiteId: Map[SiteId, Map[PageId, Set[UserId]]])
+  clientsByUserIdBySiteId: Map[SiteId, Map[UserId, WebSocketClient]],
+  watcherIdsByPageIdBySiteId: Map[SiteId, Map[PageId, Set[UserId]]])
+
+case class ClientsAllSites(
+  clientsInactiveFirst: immutable.Seq[(SiteUserId, WebSocketClient)])
 
 
 
@@ -93,12 +97,18 @@ class PubSubApi(private val actorRef: ActorRef) {
 
   SHOULD; PRIVACY // change from site id to publ site id [5UKFBQW2].
 
-  def userSubscribed(whoSubscribed: UserSubscribed) {
-    actorRef ! whoSubscribed
+  def mayConnectClient(siteUserId: SiteUserId): Future[Option[ErrorMessage]] = {
+    val futureReply: Future[Any] =
+          actorRef.ask(MayConnect(siteUserId))(akka.util.Timeout(timeout))
+    futureReply.asInstanceOf[Future[Option[ErrorMessage]]]
+  }
+
+  def userSubscribed(who: UserConnected) {
+    actorRef ! who
   }
 
   def unsubscribeUser(siteId: SiteId, user: Participant, browserIdData: BrowserIdData) {
-    actorRef ! UnsubscribeUser(siteId, user, browserIdData)
+    actorRef ! DisconnectUser(siteId, user, browserIdData)
   }
 
   def userWatchesPages(siteId: SiteId, userId: UserId, pageIds: Set[PageId]) {
@@ -119,10 +129,15 @@ class PubSubApi(private val actorRef: ActorRef) {
   }
 
   def debugGetSubscribers(siteId: SiteId): Future[PubSubState] = {
-    actorRef ! DebugGetSubscribers(siteId)
     val futureReply: Future[Any] =
-      actorRef.ask(DebugGetSubscribers(siteId))(akka.util.Timeout(timeout))
+          actorRef.ask(DebugGetSubscribers(siteId))(akka.util.Timeout(timeout))
     futureReply.asInstanceOf[Future[PubSubState]]
+  }
+
+  def debugGetClientsAllSites(): Future[ClientsAllSites] = {
+    val futureReply: Future[Any] =
+          actorRef.ask(DebugGetClientsAllSites)(akka.util.Timeout(timeout))
+    futureReply.asInstanceOf[Future[ClientsAllSites]]
   }
 }
 
@@ -135,6 +150,8 @@ class StrangerCounterApi(private val actorRef: ActorRef) {
 }
 
 
+private case class MayConnect(siteUserId: SiteUserId)
+
 private case class PublishMessage(message: Message, byId: UserId)
 
 private case class UserWatchesPages(
@@ -143,19 +160,21 @@ private case class UserWatchesPages(
 private case class UserIsActive(
   siteId: SiteId, user: Participant, browserIdData: BrowserIdData)
 
-case class UserSubscribed(
+case class UserConnected(
   siteId: SiteId,
   user: Participant,
   browserIdData: BrowserIdData,
   watchedPageIds: Set[PageId],
   wsOut: SourceQueueWithComplete[JsValue])
 
-private case class UnsubscribeUser(
+private case class DisconnectUser(
   siteId: SiteId, user: Participant, browserIdData: BrowserIdData)
 
 private case object DeleteInactiveSubscriptions
 
 private case class DebugGetSubscribers(siteId: SiteId)
+
+private case object DebugGetClientsAllSites
 
 private case class StrangerSeen(siteId: SiteId, browserIdData: BrowserIdData)
 
@@ -170,15 +189,25 @@ private case object CloseWebSocketConnections
   */
 case class WebSocketClient(
   user: Participant,
+  firstConnectedAt: When,
   connectedAt: When,
-  activeAt: When,
+  humanActiveAt: When,
   watchingPageIds: Set[PageId],
   wsOut: SourceQueueWithComplete[JsValue]) {
 
   override def toString: String =
     o"""${user.nameHashId},
+        first connected: ${toIso8601T(firstConnectedAt.toJavaDate)},
         connected: ${toIso8601T(connectedAt.toJavaDate)},
-        active: ${toIso8601T(activeAt.toJavaDate)},
+        active: ${toIso8601T(humanActiveAt.toJavaDate)},
+        watches: [${watchingPageIds.mkString(", ")}]"""
+
+  def toStringPadded: String =
+    user.anyUsername.getOrElse("").padTo(Participant.MaxUsernameLength, ' ') +
+      " #" + user.id.toString.padTo(5, ' ') + ' ' + o"""
+        first connected: ${toIso8601T(firstConnectedAt.toJavaDate)},
+        connected: ${toIso8601T(connectedAt.toJavaDate)},
+        active: ${toIso8601T(humanActiveAt.toJavaDate)},
         watches: [${watchingPageIds.mkString(", ")}]"""
 }
 
@@ -196,12 +225,17 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
   private implicit val execCtx: ExecutionContext = globals.executionContext
 
 
-  /** Users connected via WebSocket, sorted by perhaps-*in*active first.
+  /** Users connected via WebSocket.
+    *
+    * Sorted by perhaps-*in*active first, because LinkedHashMap:
+    * """The iterator and all traversal methods of this class visit elements
+    * in the order they were inserted."""
+    *
     */
   private val clientsByUserIdBySiteId =
     mutable.HashMap[SiteId, mutable.LinkedHashMap[UserId, WebSocketClient]]()
   // Sync ---^  with --v
-  private val clientsBySiteUserIdOldestFirst =
+  private val clientsBySiteUserIdInactiveFirst =
     mutable.LinkedHashMap[SiteUserId, WebSocketClient]()
 
 
@@ -234,56 +268,118 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
 
 
   private def dontRestartIfException(message: Any): Unit = try message match {
+    case MayConnect(siteUserId) =>
+      val numConnected = clientsBySiteUserIdInactiveFirst.size
+      val maxTotal = globals.config.maxWebSocketConnectionsAllSitesTotal
+      val anyProblem =
+            if (numConnected < maxTotal) None
+            else {
+              QUOTA // Later: Max N per site?  More for large sites?
+              val message = "Too many WebSocket clients connected already [TyEREJCTWS]"
+              val howMany = s": $numConnected connected"
+              logger.warn(message + howMany)
+              Some(message + (if (globals.isProd) "" else howMany))
+            }
+      sender ! anyProblem
+
     case UserWatchesPages(siteId, userId, pageIds) =>
       val user = globals.siteDao(siteId).getParticipant(userId) getOrElse { return }
-      updateWatchedPages(siteId, userId, pageIds)
+      updateWatchedPages(siteId, userId, watchingPageIdsNow = Some(pageIds))
+
+      // Break out fn (305KTSS)
       publishPresenceIfChanged(siteId, Some(user), Presence.Active)
       redisCacheForSite(siteId).markUserOnline(user.id)
+
     case UserIsActive(siteId, user, browserIdData) =>
+      COULD_OPTIMIZE // group incoming activity messages in batches of 10 seconds,
+      // and apply them all at once — so won't need to send one WebSocket
+      // message per user and activity and receiver. Instead, one per 10 seconds
+      // and per receiver? (5JKWQU01)
+
+      // Break out fn (305KTSS) for the rest of this 'case'.
+
       publishPresenceIfChanged(siteId, Some(user), Presence.Active)
       redisCacheForSite(siteId).markUserOnlineRemoveStranger(user.id, browserIdData)
-    case UserSubscribed(siteId, user, browserIdData, watchedPageIds, wsOut) =>
+
+      // If there's a WebSocket connection, then, move this client
+      // to last in the queue, so it'll be the last one found
+      // when iterating to remove inactive clients.
+
+      // Remove:
+      val clientsById = clientsByUserIdForSite(siteId)
+      val anyClientA: Option[WebSocketClient] = clientsById.remove(user.id)
+      val anyClientB: Option[WebSocketClient] =
+            clientsBySiteUserIdInactiveFirst.remove(SiteUserId(siteId, user.id))
+
+      // Place last: (if possible)
+      if (anyClientA.isDefined != anyClientB.isDefined) {
+        logger.error(o"""Bug: Per-user-id-per-site-id or
+            per-site-user-id client missing: $anyClientA, $anyClientB [TyE603KRSTD4]""")
+      }
+      else if (anyClientA.isEmpty) {
+        // Maybe just disconnected?
+        logger.debug(o"""s$siteId: Got ${user.nameHashId} activity message but
+            there's no such WebSocket client [TyM502KRDKJ5]""")
+      }
+      else {
+        val clientA = anyClientA.get
+        val clientB = anyClientB.get
+        if (clientA ne clientB) {
+          logger.error(o"""Bug: Different per-user-id-per-site-id and
+              per-site-user-id clients: $clientA  and $clientB [TyE50KTD5X7]""")
+        }
+        // Here we place last.
+        clientsById.put(user.id, clientA)
+        clientsBySiteUserIdInactiveFirst.put(SiteUserId(siteId, user.id), clientB)
+      }
+
+    case newClient @ UserConnected(siteId, user, browserIdData, watchedPageIds, wsOut) =>
       // If the user is subscribed already, delete the old WebSocket connection
       // and use this new one instead. [ONEWSCON]
       // (If the user is subscribed already — that indicates hen has Ty open in different
       // browsers? Because each browser should need just one connection: the service
       // worker's connection. — Keeping DoS attacks in mind, better allow just one
       // connection per user, for now at least? )
+      val oldPageIds = connectOrReconnect(newClient)
+      updateWatcherIdsByPageId(
+          siteId, user.id, oldPageIds = oldPageIds, newPageIds = watchedPageIds)
 
-      // .... wip ....
+      // Skip:  publishPresence...()  also, don't mark user as online in Redis
+      // — because these subscription requests are automatic; can happen also if
+      // the human is away. And, after app server restart, the app server's
+      // caches are empty, so it'll seem as if the user just connected (even though
+      // the human might have been away, for long — can be just a browser tab that
+      // was left open).
 
-      // Mark as subscribed, even if this has been done already, to bump it's timestamp.
-      val oldPageIds = addOrUpdateSubscriber(siteId, user, watchedPageIds, wsOut)
-      updateWatcherIdsByPageId(siteId, user.id,
-        oldPageIds = oldPageIds, watchedPageIds)
-      // delete any old ws
-
-      // Don't mark user as online in Redis, and don't publish presence — because these
-      // subscription requests are automatic. And, after app server restart, the app server's
-      // caches are empty, so it'll seem as if the user just connected (even though hen might
-      // have been connected but inactive, for long).
-    case UnsubscribeUser(siteId, user, browserIdData) =>
-      val oldPageIds = removeSubscriber(siteId, user)
-      updateWatcherIdsByPageId(siteId, user.id, oldPageIds = oldPageIds, Set.empty)
-      // delete any old ws
-      // This, though, (in comparison to UserSubscribed) means the user logged out. So publ presence.
+    case DisconnectUser(siteId, user, browserIdData) =>
+      val watchedPageIds = disconnect(siteId, user)
+      updateWatcherIdsByPageId(
+          siteId, user.id, oldPageIds = watchedPageIds, newPageIds = Set.empty)
       redisCacheForSite(siteId).markUserOffline(user.id)
       publishPresenceAlways(siteId, Some(user), Presence.Away)
+
     case PublishMessage(message: Message, byId: UserId) =>
       publishStorePatchAndNotfs(message, byId)
+
     case DeleteInactiveSubscriptions =>
       deleteInactiveSubscriptions()
       removeInactiveUserFromRedisPublishAwayPresence()
+
     case DebugGetSubscribers(siteId) =>
       val state: PubSubState = debugMakeState(siteId)
       sender ! state
+
+    case DebugGetClientsAllSites =>
+      sender ! debugMakeStateAllSites()
+
     case StrangerSeen(siteId, browserIdData) =>
       redisCacheForSite(siteId).markStrangerOnline(browserIdData)
+
     case CloseWebSocketConnections =>
       // In dev and test, unless closing all WebSockets, they can linger
       // across Play app reload — confusing.
-      clientsBySiteUserIdOldestFirst.valuesIterator foreach { client =>
-        client.wsOut.complete()
+      clientsBySiteUserIdInactiveFirst.valuesIterator foreach { client =>
+        client.wsOut.complete() // disconnects
       }
   }
   catch {
@@ -294,74 +390,119 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
   }
 
 
-  private def updateWatchedPages(siteId: SiteId, userId: UserId, newPageIds: Set[PageId]) {
+  private def updateWatchedPages(siteId: SiteId, userId: UserId,
+        watchingPageIdsNow: Option[Set[PageId]] = None,
+        stoppedWatchingPageId: Option[PageId] = None) {
+
+    dieIf(watchingPageIdsNow.isDefined && stoppedWatchingPageId.isDefined, "TyE703RKDHF24")
+
     val clientsById = clientsByUserIdForSite(siteId)
-    val oldEntry: WebSocketClient = clientsById.getOrElse(userId, {
-      // Not yet subscribed. Do nothing, right now. Soon the browser js should subscribe to
-      // events, and *then* We'll remember the set-of-watched-pages. (No point in
+    val clientBefore: WebSocketClient = clientsById.getOrElse(userId, {
+      // Do nothing, not yet subscribed. Soon the browser should subscribe to
+      // events, and *then* we'll remember the set-of-watched-pages. (No point in
       // remembering watched pages, before user has subscribed and it's time to send events.)
+      logger.debug(
+          s"s$siteId: Not updating watched pages for $userId: Not connected [TyM503RSKD]")
       return
     })
-    val updatedEntry = oldEntry.copy(watchingPageIds = newPageIds)
 
-    // Woud want to sort again?
-    clientsById.put(userId, updatedEntry)
-    clientsBySiteUserIdOldestFirst.put(SiteUserId(siteId, userId), updatedEntry)
+    val newPageIds = watchingPageIdsNow.getOrElse(
+          clientBefore.watchingPageIds - stoppedWatchingPageId.getOrDie("TyE05KTS5JI"))
 
-    updateWatcherIdsByPageId(siteId, userId, oldPageIds = oldEntry.watchingPageIds, newPageIds)
+    val updatedClient = clientBefore.copy(
+          watchingPageIds = newPageIds,
+          humanActiveAt = globals.now())
+
+    clientsById.put(userId, updatedClient)
+    clientsBySiteUserIdInactiveFirst.put(SiteUserId(siteId, userId), updatedClient)
+
+    updateWatcherIdsByPageId(
+        siteId, userId, oldPageIds = clientBefore.watchingPageIds, newPageIds)
   }
 
 
   /** Returns any previously watched pages.
     */
-  private def addOrUpdateSubscriber(siteId: SiteId, user: Participant,
-        watchedPageIds: Set[PageId], wsOut: SourceQueueWithComplete[JsValue])
-        : Set[PageId] = {
-    traceLog(siteId, s"Adding/updating subscriber ${user.nameHashId} [TyDADUPSUBSC]")
+  private def connectOrReconnect(newClientData: UserConnected): Set[PageId] = {
+    val UserConnected(
+          siteId, user, _ /*browserIdData*/, watchedPageIds, wsOut) = newClientData
 
-    val subscribersById = clientsByUserIdForSite(siteId)
+    val clientsByUserId = clientsByUserIdForSite(siteId)
     val now = globals.now()
+    val anyOldClient = clientsByUserId.get(user.id)
 
-    // Remove and reinsert, so inactive users will be the first ones found when iterating.
-    val oldEntry = subscribersById.remove(user.id)
-    clientsBySiteUserIdOldestFirst.remove(SiteUserId(siteId, user.id))
+    // Disconnect any old WebSocket:
 
     // At most one WebSocket connection per user, for now. A browser needs just one,
-    // from its service worker (if available).
+    // from its service worker, if available.
 
-    // BUT does the browser understand to reconnect after this!
+    // (Don't remove() the clients from the LinkedHashMap:s though: We don't
+    // want them reinserted and placed last, because reconnecting doesn't
+    // necessarily mean the human was active.)
 
-    val (connectedSince, oldPageIds: Set[PageId]) = oldEntry map { entry =>
-      traceLog(siteId,
-          s"Closing old WebSocket connection to ${user.nameHashId} [TyDWSCLOSEOLD]")
-      entry.wsOut.offer(JsString("Please reconnect"))
-      entry.wsOut.complete()
-      (entry.connectedAt, entry.watchingPageIds)
-    } getOrElse (now, immutable.Set.empty)
+    val (firstConnectedAt, humanActiveAt: When, oldPageIds: Set[PageId]) =
+          anyOldClient map { oldClient =>
+      traceLog(siteId, s"Closing WebSocket: ${user.nameHashId}, will reconnect [TyMWSXOLD]")
+      oldClient.wsOut.complete() // disconnects
+      (oldClient.firstConnectedAt, oldClient.humanActiveAt, oldClient.watchingPageIds)
+    } getOrElse (
+        now, now, immutable.Set.empty)
 
-    val newEntry = WebSocketClient(user, connectedSince, activeAt = now, watchedPageIds, wsOut)
+    // Connect:
 
-    subscribersById.put(user.id, newEntry)
-    clientsBySiteUserIdOldestFirst.put(SiteUserId(siteId, user.id), newEntry)
+    val message =
+      if (anyOldClient.isDefined) s"Reconnecting WebSocket: ${user.nameHashId} [TyMWSRECON]"
+      else  s"New WebSocket: ${user.nameHashId} [TyMWSNEWCON]"
+    traceLog(siteId, message)
+
+    val newClient = WebSocketClient(
+          user, firstConnectedAt = firstConnectedAt, connectedAt = now,
+          humanActiveAt = humanActiveAt,
+          watchedPageIds, wsOut)
+
+    clientsByUserId.put(user.id, newClient)
+    clientsBySiteUserIdInactiveFirst.put(SiteUserId(siteId, user.id), newClient)
 
     oldPageIds
   }
 
 
-  private def removeSubscriber(siteId: SiteId, user: Participant): Set[PageId] = {
-    // COULD tell Nchan about this too
-    traceLog(siteId, s"Removing subscriber ${user.nameHashId} [TyDRMSUBSC]")
-    clientsBySiteUserIdOldestFirst.remove(SiteUserId(siteId, user.id))
-    val oldEntry = clientsByUserIdForSite(siteId).remove(user.id)
-    oldEntry.map(_.watchingPageIds) getOrElse Set.empty
+  /** Returns the page ids the user was watching.
+    */
+  private def disconnect(siteId: SiteId, user: Participant): Set[PageId] = {
+    val anyClientA = clientsBySiteUserIdInactiveFirst.remove(SiteUserId(siteId, user.id))
+    val anyClientB = clientsByUserIdForSite(siteId).remove(user.id)
+
+    if (anyClientA.isDefined != anyClientB.isDefined) {
+      logger.error(o"""Bug: Per-user-id-per-site-id or
+            per-site-user-id client missing: $anyClientA, $anyClientB [TyE502KTDH4]""")
+    }
+
+    if (anyClientA.isEmpty) {
+      traceLog(siteId, s"No WebSocket for ${user.nameHashId} to disconnect [TyM05RKDH2]")
+      return Set.empty
+    }
+
+    val clientA = anyClientA.get
+    val clientB = anyClientB.get
+    if (clientA ne clientB) {
+      logger.error(o"""Bug: Different per-user-id-per-site-id and
+          per-site-user-id clients: $clientA  and $clientB [TyE703KDW4]""")
+    }
+
+    traceLog(siteId, s"Disconnecting WebSocket for ${user.nameHashId} [TyMRMSUBSC]")
+    clientA.wsOut.complete() // disconnects
+    clientA.watchingPageIds
   }
 
 
-  private def publishPresenceIfChanged(siteId: SiteId, users: Iterable[Participant], newPresence: Presence) {
-    COULD_OPTIMIZE // send just 1 request, list many users. (5JKWQU01)
+  private def publishPresenceIfChanged(siteId: SiteId, users: Iterable[Participant],
+        newPresence: Presence) {
+    COULD_OPTIMIZE // send just 1 WebSocket message, list many users. (5JKWQU01)
     users foreach { user =>
       val isActive = redisCacheForSite(siteId).isUserActive(user.id)
-      if (isActive && newPresence != Presence.Active || !isActive && newPresence != Presence.Away) {
+      if (isActive && newPresence != Presence.Active ||
+          !isActive && newPresence != Presence.Away) {
         publishPresenceImpl(siteId, user, newPresence)
       }
     }
@@ -369,7 +510,7 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
 
 
   private def publishPresenceAlways(siteId: SiteId, users: Iterable[Participant], newPresence: Presence) {
-    COULD_OPTIMIZE // send just 1 request, list many users. (5JKWQU01)
+    COULD_OPTIMIZE // send just 1 WebSocket message, list many users. (5JKWQU01)
     users foreach { user =>
       publishPresenceImpl(siteId, user, newPresence)
     }
@@ -384,6 +525,10 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
     val clientsByUserId = clientsByUserIdForSite(siteId)
     val toUserIds = clientsByUserId.keySet - user.id
     traceLog(siteId, s"Pupl presence ${user.nameHashId}: $presence [TyDPRESCNS]")
+
+    // If some time later, users can be "invisible", stop publishing their
+    // presence here.  [PRESPRIV]
+    // Compare with pages one may not see: [WATCHSEC].
 
     sendPublishRequest(siteId, toUserIds, "presence", Json.obj(
       "user" -> JsUser(user),
@@ -401,6 +546,7 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
         // UX COULD send an updated num-pending-review-tasks counter, though?
         !notf.tyype.isAboutReviewTask
     }
+
     notfsReceiverIsOnline foreach { notf =>
       COULD_OPTIMIZE // later: do only 1 call to siteDao, for all notfs.
       val notfsJson = siteDao.readOnlyTransaction { transaction =>
@@ -416,21 +562,55 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
 
     message match {
       case patchMessage: StorePatchMessage =>
-        val userIds = usersWatchingPage(
-          patchMessage.siteId, pageId = patchMessage.toUsersViewingPage).filter(_ != byId)
-        userIds.foreach(siteDao.markPageAsUnreadInWatchbar(_, patchMessage.toUsersViewingPage))
+        val pageId = patchMessage.toUsersViewingPage
+        val userIdsMayMaybe = usersWatchingPage(
+              patchMessage.siteId, pageId = pageId).filter(_ != byId)
 
-        def lazyMessage = s"Publ storePatch to ${lazyPrettyUsers.mkString(", ")} [TyDPUBLPTCH]"
-        def lazyPrettyUsers: Iterable[String] = userIds.map(id => anyPrettyUser(siteDao.getParticipant(id), id))
+        // Access control.
+        val usersMayMaybeSee = userIdsMayMaybe.flatMap(siteDao.getUser)
+        // (Shouldn't be any non-existing users — deleting database row not implemented.)
+        val (usersMaySee, usersMayNotSee) = usersMayMaybeSee partition { user =>
+          siteDao.getPageMeta(pageId) match {
+            case None =>
+              // Cannot see a non-existing page.
+              false
+            case Some(pageMeta) =>
+              TESTS_MISSING  // [WATCHSEC]
+              val (maySee, _) = siteDao.maySeePageUseCache(pageMeta, Some(user))
+              maySee
+          }
+        }
+
+        usersMayNotSee foreach { user =>
+          // Remove the user from the page watchers list.
+          // This user was allowed to start watching the page — but now, hen may not
+          // see it. Apparently, access was recently revoked.
+          logger.debug(s"Removing ${user.nameHashId} from page ${pageId
+                } watchers, hen may not see that page [TyM405WKTD2]")
+          updateWatchedPages(message.siteId, user.id, stoppedWatchingPageId = Some(pageId))
+        }
+
+        usersMaySee foreach { user =>
+          siteDao.markPageAsUnreadInWatchbar(user.id, patchMessage.toUsersViewingPage)
+        }
+
+        def lazyMessage = s"Publ storePatch to: [${
+              usersMaySee.map(_.nameHashId).mkString(", ")}]  [TyDPUBLPTCH]"
+
         traceLog(message.siteId, lazyMessage)
 
-        sendPublishRequest(patchMessage.siteId, userIds, "storePatch", patchMessage.json)
+        sendPublishRequest(
+              patchMessage.siteId, usersMaySee.map(_.id), "storePatch", patchMessage.json)
 
       case newPageMessage: NewPageMessage =>
         COULD // send a patch to everyone looking at the topic list, so they'll
         // notice this new topic. (Unless it's private.)
         // Exclude private page members though — they got notified above,
         // via the notifications list.
+
+        // sendPublishRequest( .... )
+        //  — but excl users who may not access the category, see [WATCHSEC] above.
+
       case x =>
         unimplemented(s"Publishing ${classNameOf(x)} [TyEPUBWHAT]")
     }
@@ -444,10 +624,12 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
     val pageIdsRemoved = oldPageIds -- newPageIds
 
     def lazyPrettyUser: String = anyPrettyUser(globals.siteDao(siteId).getParticipant(userId), userId)
-    traceLog(siteId,
-        s"$lazyPrettyUser starts watching pages: $pageIdsAdded, stopped: $pageIdsRemoved [TyDWTCHPGS]")
+    traceLog(siteId, o"""$lazyPrettyUser starts watching pages: $pageIdsAdded,
+        stopped: $pageIdsRemoved [TyDWTCHPGS]""")
 
     pageIdsRemoved foreach { pageId =>
+      // If not yet any by-page-id Set, we do Not insert one: getOrElse(),
+      // but not getOrElseUpdate().
       val watcherIds = watcherIdsByPageId.getOrElse(pageId, mutable.Set.empty)
       watcherIds.remove(userId)
       if (watcherIds.isEmpty) {
@@ -455,6 +637,7 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
       }
     }
     pageIdsAdded foreach { pageId =>
+      // If not yet any by-page-id Set, we insert one: getOrElseUpdate().
       val watcherIds = watcherIdsByPageId.getOrElseUpdate(pageId, mutable.Set.empty)
       watcherIds.add(userId)
     }
@@ -469,27 +652,26 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
 
   private def sendPublishRequest(siteId: SiteId, toUserIds: Iterable[UserId], tyype: String,
         json: JsValue) {
-    SECURITY; SHOULD // extra check that I won't send messages about pages a user may not access.
     dieIf(siteId == NoSiteId, "EsE7UW7Y2", "Cannot send requests to NoSiteId")
 
-    val usersById: collection.Map[UserId, WebSocketClient] =
+    val clientsById: collection.Map[UserId, WebSocketClient] =
       clientsByUserIdBySiteId.getOrElse(siteId, Map.empty)
 
     toUserIds foreach { userId =>
-      usersById.get(userId) match {
+      clientsById.get(userId) match {
         case None =>
-        case Some(wsClient) =>
+        case Some(client) =>
           val message = Json.obj(
             "type" -> tyype,
             "data" -> json)
-          wsClient.wsOut.offer(message)
+          client.wsOut.offer(message)
       }
     }
   }
 
 
   private def isUserOnline(siteId: SiteId, userId: UserId): Boolean =
-    clientsBySiteUserIdOldestFirst.contains(SiteUserId(siteId, userId))
+    clientsBySiteUserIdInactiveFirst.contains(SiteUserId(siteId, userId))
 
 
   /** BUG when user comes back and resubscribes, there might be some/many posts that hen didn't
@@ -509,20 +691,31 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
 
     // For now:
 
-    val numToRemove = clientsBySiteUserIdOldestFirst.size - 200
+    // Trim down to 90% of max, so new clients will be accepted, but they'll
+    // cause the inactive-for-longest clients to get disconnected.
+    val maxTotal = globals.config.maxWebSocketConnectionsAllSitesTotal
+    val _90percentOfMax = maxTotal * 90 / 100
+    val numToRemove = clientsBySiteUserIdInactiveFirst.size - _90percentOfMax
 
-    clientsBySiteUserIdOldestFirst.removeAtMostWhile(numToRemove, {
+    clientsBySiteUserIdInactiveFirst.removeAtMostWhile(numToRemove, {
           case (siteUserId, client) =>
 
       val siteId = siteUserId.siteId
       val user = client.user
-      traceLog(siteId, o"""Closing WS for ${user.nameHashId}, was connected
-          since: ${client.connectedAt}, last active: ${client.activeAt} [TyMUNSUB]""")
-      client.wsOut.complete()
+      traceLog(siteId, o"""Closing WebSocket for ${user.nameHashId}, first connected:
+          ${client.firstConnectedAt}, human last active: ${client.humanActiveAt}
+          [TyMUNSUB]""")
+      client.wsOut.complete() // disconnects
 
-      clientsByUserIdBySiteId.get(siteId).map(_.remove(siteUserId.userId))
+      val clientsByUserId = clientsByUserIdBySiteId.get(siteId)
+      val anySameClient = clientsByUserId.flatMap(_.remove(siteUserId.userId))
+      if (anySameClient isNotEq client) {
+        logger.error(o"""Bug: Different per-user-id-per-site-id and
+            per-site-user-id clients: $client  and $anySameClient [TyE603RKHNS4]""")
+      }
+
       updateWatcherIdsByPageId(
-        siteId, user.id, oldPageIds = client.watchingPageIds, newPageIds = Set.empty)
+          siteId, user.id, oldPageIds = client.watchingPageIds, newPageIds = Set.empty)
 
       // For now, remove all numToRemove. Later, maybe allow at most N per site?
       true
@@ -540,7 +733,7 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
           traceLog(siteId, s"Unsubscribing inactive ${user.nameHashId} [TyDUNSUBINACTV]")
           updateWatcherIdsByPageId(
               siteId, user.id, oldPageIds = userWhenPages.watchingPageIds, newPageIds = Set.empty)
-          clientsBySiteUserIdOldestFirst.remove(SiteUserId(siteId, user.id))
+          clientsBySiteUserIdInactiveFirst.remove(SiteUserId(siteId, user.id))
           true
         }
       }
@@ -561,13 +754,17 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
   }
 
 
+  /** Returns clients for on site only.
+    */
   def debugMakeState(siteId: SiteId): PubSubState = {
-    val subscribersById =
+    // Convert to immutable structures:
+
+    val clientsByUserId =
           Map[UserId, WebSocketClient](
             clientsByUserIdBySiteId.getOrElse(siteId, Map.empty).toSeq: _*)
 
     val pagesAndWatchers = watcherIdsByPageIdBySiteId.getOrElse(siteId, Map.empty) map {
-      watcherIdsByPageId: (PageId, mutable.Set[UserId]) =>
+          watcherIdsByPageId: (PageId, mutable.Set[UserId]) =>
       watcherIdsByPageId._1 -> Set(watcherIdsByPageId._2.toSeq: _*)
     }
 
@@ -575,10 +772,19 @@ class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
           Map[PageId, Set[UserId]](pagesAndWatchers.toSeq: _*)
 
     PubSubState(
-        subscribersBySite =
-          Map[SiteId, Map[UserId, WebSocketClient]](siteId -> subscribersById),
-        watcherIdsByPageSiteId =
+        clientsByUserIdBySiteId =
+          Map[SiteId, Map[UserId, WebSocketClient]](siteId -> clientsByUserId),
+        watcherIdsByPageIdBySiteId =
           Map[SiteId, Map[PageId, Set[UserId]]](siteId -> watcherIdsByPageId))
+  }
+
+
+  /** Returns clients for all sites — but no per site watchers, only clients by
+    * recent-active-last.
+    */
+  def debugMakeStateAllSites(): ClientsAllSites = {
+    ClientsAllSites(
+        clientsInactiveFirst = clientsBySiteUserIdInactiveFirst.to[Vector])
   }
 
 

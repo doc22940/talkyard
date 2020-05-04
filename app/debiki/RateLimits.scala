@@ -173,10 +173,21 @@ object RateLimits {
 
 
   object ConnectWebSocket extends RateLimits {
-    val key = "WS"
+    val key = "WSC"
     val what = "Connected WebSocket too quickly"
-    def maxPerFifteenSeconds = 50              // 200/min
-    def maxPerFifteenMinutes: Int =  50 * 15   //  50/min
+    def maxPerFifteenSeconds = 25              // 100/min
+    def maxPerFifteenMinutes: Int =  30 * 15   //  30/min
+    def maxPerDay: Int = Unlimited
+    def maxPerDayNewUser: Int = Unlimited
+  }
+
+
+  // This is per user, since needs to be authenticated to send ws messages.
+  object SendWebSocketMessage extends RateLimits {
+    val key = "WSM"
+    val what = "Sent too many WebSocket messages"
+    def maxPerFifteenSeconds = 25              // 100/min
+    def maxPerFifteenMinutes: Int =  30 * 15   //  30/min
     def maxPerDay: Int = Unlimited
     def maxPerDayNewUser: Int = Unlimited
   }

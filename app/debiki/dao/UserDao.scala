@@ -1129,12 +1129,15 @@ trait UserDao {
     val chatsInclForbidden = tx.loadOpenChatsPinnedGlobally()
     BUG // Don't join a chat again, if has left it. Needn't fix now, barely matters.
     val joinedChats = ArrayBuffer[PageMeta]()
+
     chatsInclForbidden foreach { chatPageMeta =>
       val (maySee, debugCode) = maySeePageUseCache(chatPageMeta, Some(user))
       if (maySee) {
         val couldntAdd = mutable.Set[UserId]()
-        joinLeavePageImpl(Set(user.id), chatPageMeta.pageId, add = true, byWho = Who.System,
-            couldntAdd, tx)
+
+        joinLeavePage(Set(user.id), chatPageMeta.pageId, add = true,
+            byWho = Who.System, couldntAdd, tx)
+
         if (!couldntAdd.contains(user.id)) {
           joinedChats += chatPageMeta
         }
@@ -1169,7 +1172,8 @@ trait UserDao {
     val couldntAdd = mutable.Set[UserId]()
 
     val pageMeta = readWriteTransaction { tx =>
-      joinLeavePageImpl(userIds, pageId, add, byWho, couldntAdd, tx)
+      // This checks if byWho may see the page, and may add userIds to it.
+      joinLeavePage(userIds, pageId, add, byWho, couldntAdd, tx)
     }
 
     SHOULD // push new member notf to browsers, so that this gets updated: [5FKE0WY2]
@@ -1266,6 +1270,9 @@ trait UserDao {
         : Option[BareWatchbar] = {
     BUG; RACE // when loading & saving the watchbar. E.g. if a user joins a page herself, and
     // another member adds her to the page, or another page, at the same time.
+
+    SECURITY // [WATCHSEC] allowed to access the pages? Verify the caller has done
+    // the authz check — if not, shouldn't add pages to the user's watchbar!
 
     val oldWatchbar = getOrCreateWatchbar(userId)
     var newWatchbar = oldWatchbar

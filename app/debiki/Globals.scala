@@ -624,7 +624,7 @@ class Globals(
         sudo docker-compose restart web app""")
     s"$scheme://$hostname$colonPort"
   }
-  def originOf(request: p.mvc.Request[_]): String = s"$scheme://${request.host}"
+  def originOf(request: p.mvc.RequestHeader): String = s"$scheme://${request.host}"
 
   def originOf(request: GetRequest): String =
     originOf(request.underlying)
@@ -907,14 +907,14 @@ class Globals(
         pubSub.closeWebSocketConnections()
       }
 
-      logger.info(s"Stopping actors ...")
-
-      // Shutdown the notifier before the mailer, so no notifications are lost
-      // because there was no mailer that could send them.
+      // Shutdown the NotifierActor before the MailerActor, so no notifications
+      // are lost because the MailerActor was gone, couldn't send them.
+      logger.info(s"Stopping the NotifierActor ...")
       val (name, future) = stopPlease(state.notifierActorRef)
       Await.result(future, ShutdownTimeout)
 
       // Shutdown in parallel.
+      logger.info(s"Stopping remaining actors ...")
       val futureShutdownResults = Seq(
             stopPlease(state.mailerActorRef),
             stopPlease(state.renderContentActorRef),
@@ -1157,6 +1157,9 @@ class Config(conf: play.api.Configuration) extends TyLogging {
   // --------------------------------------
 
   val useServiceWorker: Boolean = getBoolOrDefault("talkyard.useServiceWorker", default = true)
+
+  val maxWebSocketConnectionsAllSitesTotal: Int =
+    getIntOrDefault("talkyard.maxWebSockets", 200)
 
   // Remove these later — just for now, new feature switches.
   // Don't set to true just yet — Apple iOS 12 handles None as Strict,
