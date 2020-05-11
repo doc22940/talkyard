@@ -642,6 +642,7 @@ class JsonMaker(dao: SiteDao) {
         case Some(modifiedWatchbar) =>
 
           // Double check we may see the page(s) we're adding to the watchbar. [WATCHSEC]
+          SEC_TESTS_MISSING // TyT602KRGJG
           val (maySee, debugCode) = dao.maySeePageUseCache(
                 pageRequest.thePageMeta, Some(requester))
           if (!maySee)

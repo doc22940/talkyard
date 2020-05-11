@@ -1203,16 +1203,22 @@ trait UserDao {
 
   private def joinLeavePage(userIds: Set[UserId], pageId: PageId, add: Boolean,
         byWho: Who, couldntAdd: mutable.Set[UserId], tx: SiteTransaction): PageMeta = {
-
-    val pageMeta = tx.loadPageMeta(pageId) getOrElse
-      security.throwIndistinguishableNotFound("42PKD0")
+    SEC_TESTS_MISSING // TyT502RKTJF4  trying to join a page on may not see: open page
 
     val usersById = tx.loadUsersAsMap(userIds + byWho.id)
     val me = usersById.getOrElse(byWho.id, throwForbidden(
-      "EsE6KFE0X", s"Your user cannot be found, id: ${byWho.id}"))
+          "EsE6KFE0X", s"Your user cannot be found, id: ${byWho.id}"))
+
+    val pageMeta = tx.loadPageMeta(pageId) getOrElse
+          security.throwIndistinguishableNotFound("42PKD0")
 
     // AuthZ check 1/2.
     throwIfMayNotSeePage(pageMeta, Some(me))(tx)
+
+    // Right now, to join a forum page = sub community, one just adds it to one's watchbar.
+    // But we don't add/remove the user from the page members list, so nothing to do here.
+    if (pageMeta.pageType == PageType.Forum)
+      return pageMeta
 
     lazy val numMembersAlready = tx.loadMessageMembers(pageId).size
     if (add && numMembersAlready + userIds.size > 400) {
@@ -1228,11 +1234,6 @@ trait UserDao {
     if (!me.isStaff && me.id != pageMeta.authorId && !addingRemovingMyselfOnly)
       throwForbidden(
         "EsE28PDW9", "Only staff and the page author may add/remove people to/from the page")
-
-    // Right now, to join a forum page = sub community, one just adds it to one's watchbar.
-    // But we don't add/remove the user from the page members list, so nothing to do here.
-    if (pageMeta.pageType == PageType.Forum)
-      return pageMeta
 
     if (add) {
       if (!pageMeta.pageType.isGroupTalk)
@@ -1276,6 +1277,7 @@ trait UserDao {
 
     if (add) {
       // Check (double check?) if the user may access the pages. [WATCHSEC]
+      SEC_TESTS_MISSING // TyT602KRGJG  add page one may not see
       val anyMayNotSeePage = pages find { page =>
         val user = getParticipant(userId)
         val (maySee, _) = maySeePageUseCache(page, user)

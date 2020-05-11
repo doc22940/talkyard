@@ -169,6 +169,7 @@ class EmbeddedTopicsController @Inject()(cc: ControllerComponents, edContext: Ed
       pageId <- anyRealPageId
       pageMeta <- dao.getPageMeta(pageId)
     } {
+      TESTS_MISSING // test may-not-see  TyT035KRGMTW2
       val (maySee, debugCode) = dao.maySeePageUseCache(pageMeta, requester)
       if (!maySee)
         security.throwIndistinguishableNotFound(debugCode)
