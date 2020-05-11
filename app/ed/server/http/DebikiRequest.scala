@@ -32,7 +32,8 @@ import play.api.mvc
 import play.api.mvc._
 
 
-abstract class DebikiRequest[A] extends AuthnReqHeader {   // RENAME to AuthnReq
+abstract class DebikiRequest[A] extends AuthnReqHeader {   // RENAME to AuthnReq NO to TyReq?
+                                                           // because maybe not authn.
   def request: Request[A]
   override def underlying: Request[A] = request
   def body: A = request.body

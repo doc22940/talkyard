@@ -216,6 +216,7 @@ case class WebSocketClient(
 /** Publishes events via WebSocket.
   */
 class PubSubActor(val nginxHost: String, val globals: Globals) extends Actor {
+  // CR THIS
 
   private val logger = TyLogger("PubSubActor")
 

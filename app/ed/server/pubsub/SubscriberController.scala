@@ -57,7 +57,7 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
         Result,
         // Or an In and Out stream, for talking with the client.
         Flow[JsValue, JsValue, _]]] = {
-
+    // CR THIS WHOLE FILE
     val site = globals.lookupSiteOrThrow(request)
 
     val authnReq = authenticateWebSocket(site, request) getOrIfBad { result =>
@@ -125,7 +125,8 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
             expireIdleAfterMins = expireIdleAfterMins, maySetCookies = false)
 
     // Needs to be a cookie already set. [WSXSRF]
-    dieIf(xsrfOk.value.isEmpty, "TyE406WKTDK")
+    throwForbiddenIf(xsrfOk.value.isEmpty,
+          "TyEWS0XSRFCO", "No xsrf cookie")
 
     val (mendedSidStatus, _ /* deleteSidCookie */) =
       if (actualSidStatus.canUse) (actualSidStatus, false)
@@ -232,8 +233,8 @@ class SubscriberController @Inject()(cc: ControllerComponents, tyCtx: EdContext)
                 }
               case other =>
                 // Close — got no xsrf token.
-                logger.debug(s"$prefix $who skipped xsrf token [TyEWS0XSRF]")
-                client.wsOut.offer(JsString("Send xsrf token. Bye. [TyEWS0XSRF]"))
+                logger.debug(s"$prefix $who skipped xsrf token [TyEWS0XSRFTKN]")
+                client.wsOut.offer(JsString("Send xsrf token. Bye. [TyEWS0XSRFTKN]"))
                 client.wsOut.complete()
             }
           }

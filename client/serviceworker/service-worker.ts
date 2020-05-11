@@ -2,6 +2,7 @@
 /// <reference path="./constants.ts" />
 /// <reference path="./magic-time.ts" />
 
+// CR THIS
 
 // Docs: https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API
 // Read?: https://www.kollegorna.se/en/2017/06/service-worker-gotchas/
